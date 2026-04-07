@@ -18,6 +18,25 @@ def main():
         default=None,
         help="optional metadata.json path for resolving video_path and win/lose type",
     )
+    parser.add_argument(
+        "--winner_path_keyword",
+        type=str,
+        default="winvideos",
+        help="keyword in clip_path used to identify winner(real) videos in metadata-only mode",
+    )
+    parser.add_argument(
+        "--loser_path_keyword",
+        type=str,
+        default="losevideos",
+        help="keyword in clip_path used to identify loser videos in metadata-only mode",
+    )
+    parser.add_argument(
+        "--group_by",
+        type=str,
+        default="caption",
+        choices=["caption", "prompt_id"],
+        help="group key in metadata-only mode",
+    )
     parser.add_argument("--output", type=str, required=True, help="group json path")
     parser.add_argument(
         "--output_metadata_json",
@@ -69,12 +88,15 @@ def main():
                 groups[pid]["losers"].append(loser_obj)
     else:
         # Mode C: build groups directly from metadata.json.
-        # Winner is inferred from path containing "winvideos"; losers from "losevideos".
+        # Winner/loser are inferred from clip_path keywords.
         by_caption = defaultdict(list)
         for idx, item in enumerate(metadata):
-            cap = item.get("misc", {}).get("frame_caption", [""])
-            cap = cap[0] if isinstance(cap, list) else cap
-            by_caption[cap].append((idx, item))
+            if args.group_by == "prompt_id":
+                key = item.get("misc", {}).get("prompt_id", "")
+            else:
+                key = item.get("misc", {}).get("frame_caption", [""])
+                key = key[0] if isinstance(key, list) else key
+            by_caption[key].append((idx, item))
 
         for cap, samples in by_caption.items():
             winners = []
@@ -87,10 +109,13 @@ def main():
                     "pc_score": 0.0,
                     "video_path": item.get("basic", {}).get("clip_path", ""),
                 }
-                if "winvideos" in p:
+                if args.winner_path_keyword.lower() in p:
                     winners.append(entry)
-                else:
+                elif args.loser_path_keyword.lower() in p:
                     losers.append(entry)
+                else:
+                    # ignore unknown tag path in metadata-only mode
+                    continue
             if len(winners) == 0 or len(losers) == 0:
                 continue
             winner_obj = {
