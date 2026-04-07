@@ -201,3 +201,69 @@ class TextVideoDPO(Dataset):
             return {"video": combined_frames, "caption": frame_caption,"dupfactor":dupfactor}
         else:
             return {"video": combined_frames, "caption": frame_caption,"dupfactor":1.0}
+
+
+class TextVideoGroupDPO(Dataset):
+    """
+    Group-wise DPO dataset.
+    Each item in group.json is expected to include:
+      - frame_caption
+      - winner: {video_idx}
+      - losers: [{video_idx, sa_score, pc_score}, ...]
+    """
+
+    def __init__(
+        self,
+        data_root,
+        resolution,
+        video_length,
+        frame_stride=4,
+        subset_split="all",
+        clip_length=1.0,
+    ):
+        self.data = TextVideo(
+            data_root, resolution, video_length, frame_stride, subset_split, clip_length
+        )
+        self.groups = []
+        self.data_root = data_root
+        with open(self.data_root, "r") as f:
+            self.config = yaml.load(f, Loader=yaml.FullLoader)
+
+        for meta_path in self.config["META"]:
+            group_path = os.path.join(meta_path, "group.json")
+            if not os.path.exists(group_path):
+                continue
+            with open(group_path, "r") as f:
+                groups = json.load(f)
+                self.groups.extend(groups)
+        print(f"GroupDPO dataset has {self.__len__()} groups")
+
+    def __len__(self):
+        return len(self.groups)
+
+    def __getitem__(self, index):
+        item = self.groups[index]
+        frame_caption = item.get("frame_caption", "")
+        if isinstance(frame_caption, list):
+            frame_caption = frame_caption[0]
+
+        winner_idx = int(item["winner"]["video_idx"])
+        losers = item["losers"]
+        loser_indices = [int(x["video_idx"]) for x in losers]
+        all_indices = [winner_idx] + loser_indices
+
+        videos = [self.data[idx]["video"] for idx in all_indices]
+        combined_frames = torch.cat(videos, dim=0)
+
+        sa_scores = [1.0] + [float(x.get("sa_score", 0.0)) for x in losers]
+        pc_scores = [1.0] + [float(x.get("pc_score", 0.0)) for x in losers]
+
+        return {
+            "video": combined_frames,
+            "caption": frame_caption,
+            "dupfactor": 1.0,
+            "group_size": len(all_indices),
+            "winner_index": 0,
+            "sa_scores": torch.tensor(sa_scores, dtype=torch.float32),
+            "pc_scores": torch.tensor(pc_scores, dtype=torch.float32),
+        }
