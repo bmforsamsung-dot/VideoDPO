@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 from collections import defaultdict
 
@@ -18,6 +19,12 @@ def main():
         help="optional metadata.json path for resolving video_path and win/lose type",
     )
     parser.add_argument("--output", type=str, required=True, help="group json path")
+    parser.add_argument(
+        "--output_metadata_json",
+        type=str,
+        default=None,
+        help="optional compact metadata.json output with re-indexed video_idx",
+    )
     parser.add_argument("--losers_per_prompt", type=int, default=5)
     args = parser.parse_args()
 
@@ -103,6 +110,44 @@ def main():
     with open(args.output, "w") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     print(f"Saved {len(out)} groups -> {args.output}")
+
+    # Optional: build compact metadata.json aligned to group.json indices.
+    # This helps when you want a group-only subset dataset.
+    if args.output_metadata_json is not None:
+        if metadata is None:
+            raise ValueError("--output_metadata_json requires --metadata_json")
+
+        used_indices = set()
+        for g in out:
+            used_indices.add(int(g["winner"]["video_idx"]))
+            for l in g["losers"]:
+                used_indices.add(int(l["video_idx"]))
+        used_indices = sorted(list(used_indices))
+
+        old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(used_indices)}
+        compact_meta = []
+        for old_idx in used_indices:
+            item = copy.deepcopy(metadata[old_idx])
+            if "basic" not in item:
+                item["basic"] = {}
+            item["basic"]["source_globalidx"] = int(
+                item["basic"].get("globalidx", old_idx)
+            )
+            item["basic"]["globalidx"] = int(old_to_new[old_idx])
+            compact_meta.append(item)
+
+        for g in out:
+            g["winner"]["video_idx"] = old_to_new[int(g["winner"]["video_idx"])]
+            for l in g["losers"]:
+                l["video_idx"] = old_to_new[int(l["video_idx"])]
+
+        with open(args.output, "w") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        with open(args.output_metadata_json, "w") as f:
+            json.dump(compact_meta, f, ensure_ascii=False, indent=2)
+        print(
+            f"Saved compact metadata ({len(compact_meta)} videos) -> {args.output_metadata_json}"
+        )
 
 
 if __name__ == "__main__":
