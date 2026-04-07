@@ -38,6 +38,7 @@ from lvdm.distributions import DiagonalGaussianDistribution, normal_kl
 from lvdm.ema import LitEma
 from lvdm.samplers.ddim import DDIMSampler
 from lvdm.models.utils_diffusion import make_beta_schedule
+from lvdm.modules.losses.physics_reward import compute_physics_weights
 from utils.common_utils import instantiate_from_config
 
 __conditioning_keys__ = {"concat": "c_concat", "crossattn": "c_crossattn", "adm": "y"}
@@ -78,6 +79,13 @@ class DDPM(pl.LightningModule):
         logvar_init=0.0,
         beta_dpo=5000.0, # dpo config 
         dupbeta=1, # dpo config 
+        group_size=2,
+        lambda_physics=1.0,
+        kappa_alpha=8.0,
+        kappa_gamma=8.0,
+        b_alpha=0.5,
+        b_gamma=0.5,
+        alpha_min=0.05,
     ):
         super().__init__()
         assert parameterization in [
@@ -137,12 +145,20 @@ class DDPM(pl.LightningModule):
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
 
         # add loss dpo
-        if self.loss_type == "dpo":
+        if self.loss_type in ["dpo", "group_dpo"]:
             self.ref_model = DiffusionWrapper(unet_config, conditioning_key)
             # freeze all
             for param in self.ref_model.diffusion_model.parameters():
                 param.requires_grad = False
+        if self.loss_type in ["dpo", "group_dpo"]:
             self.beta_dpo = beta_dpo
+            self.group_size = group_size
+            self.lambda_physics = lambda_physics
+            self.kappa_alpha = kappa_alpha
+            self.kappa_gamma = kappa_gamma
+            self.b_alpha = b_alpha
+            self.b_gamma = b_gamma
+            self.alpha_min = alpha_min
 
     def register_schedule(
         self,
@@ -403,6 +419,48 @@ class DDPM(pl.LightningModule):
         )
         return loss
 
+    def group_dpo_loss(self, target, pred):
+        model_losses = (pred - target).pow(2).mean(dim=[1, 2, 3, 4])
+        ref_pred = self.ref_pred
+        ref_losses = (ref_pred - target).pow(2).mean(dim=[1, 2, 3, 4])
+
+        g = int(self.group_size)
+        b = model_losses.shape[0] // g
+        model_losses = model_losses.view(b, g)
+        ref_losses = ref_losses.view(b, g)
+
+        # winner is index 0
+        model_w = model_losses[:, :1]
+        model_l = model_losses[:, 1:]
+        ref_w = ref_losses[:, :1]
+        ref_l = ref_losses[:, 1:]
+        inside_term = -0.5 * self.beta_dpo * ((model_w - model_l) - (ref_w - ref_l))
+
+        sa = getattr(self, "sa_scores", None)
+        pc = getattr(self, "pc_scores", None)
+        if sa is not None and pc is not None:
+            if sa.dim() == 1:
+                sa = sa.unsqueeze(0)
+                pc = pc.unsqueeze(0)
+            v, alpha, gamma = compute_physics_weights(
+                sa[:, 1:],
+                pc[:, 1:],
+                lambda_=self.lambda_physics,
+                kappa_alpha=self.kappa_alpha,
+                kappa_gamma=self.kappa_gamma,
+                b_alpha=self.b_alpha,
+                b_gamma=self.b_gamma,
+                alpha_min=self.alpha_min,
+            )
+            self.log("train/physics_v_mean", float(v.mean().detach().cpu()), on_step=True, on_epoch=False, logger=True)
+            self.log("train/alpha_mean", float(alpha.mean().detach().cpu()), on_step=True, on_epoch=False, logger=True)
+            self.log("train/gamma_mean", float(gamma.mean().detach().cpu()), on_step=True, on_epoch=False, logger=True)
+            weighted = -alpha * F.logsigmoid(gamma * inside_term)
+            loss = weighted.mean()
+        else:
+            loss = (-F.logsigmoid(inside_term)).mean()
+        return loss
+
     def get_loss(self, pred, target, mean=True):
         if self.loss_type == "l1":
             loss = (target - pred).abs()
@@ -415,6 +473,8 @@ class DDPM(pl.LightningModule):
                 loss = torch.nn.functional.mse_loss(target, pred, reduction="none")
         elif self.loss_type == "dpo":
             loss = self.dpo_loss(target, pred)
+        elif self.loss_type == "group_dpo":
+            loss = self.group_dpo_loss(target, pred)
         else:
             raise NotImplementedError("unknown loss type '{loss_type}'")
 
@@ -426,7 +486,7 @@ class DDPM(pl.LightningModule):
         model_out = self.model(x_noisy, t)
         # since we can't pass x_noisy and t to get loss
         # we have to use self.ref_pred to pass parameter
-        if self.loss_type == "dpo":
+        if self.loss_type in ["dpo", "group_dpo"]:
             self.ref_pred = self.ref_model(x_noisy, t)
 
         loss_dict = {}
@@ -951,9 +1011,14 @@ class LatentDiffusion(DDPM):
         ## image/video shape: b, c, t, h, w
         data_key = "jpg" if is_imgbatch else self.first_stage_key
         x = super().get_input(batch, data_key)
-        if self.loss_type == "dpo":
+        if self.loss_type in ["dpo", "group_dpo"]:
             # print("in get batch input prechunk ",x.shape)
-            x = torch.cat(x.chunk(2, dim=1))  # feed pixel values
+            n = batch.get("group_size", 2)
+            if torch.is_tensor(n):
+                n = int(n.flatten()[0].item())
+            n = int(n)
+            self.group_size = n
+            x = torch.cat(x.chunk(n, dim=1))  # feed pixel values
             # print("after chunk",x.shape)
         # print(x.shape);exit()
         if is_imgbatch:
@@ -984,8 +1049,8 @@ class LatentDiffusion(DDPM):
             for i, ci in enumerate(cond):
                 if random.random() < self.uncond_prob:
                     cond_emb[i] = torch.zeros_like(ci)
-        if self.loss_type == "dpo":
-            cond_emb = cond_emb.repeat(2, 1, 1)
+        if self.loss_type in ["dpo", "group_dpo"]:
+            cond_emb = cond_emb.repeat(self.group_size, 1, 1)
         out = [z, cond_emb]
         # print(z.shape,cond_emb.shape);exit()
 
@@ -1034,6 +1099,13 @@ class LatentDiffusion(DDPM):
             pass
         # dupfactor 
         self.dupfactor = batch['dupfactor']
+        if "group_size" in batch:
+            gs = batch["group_size"]
+            if torch.is_tensor(gs):
+                gs = int(gs.flatten()[0].item())
+            self.group_size = int(gs)
+        self.sa_scores = batch.get("sa_scores", None)
+        self.pc_scores = batch.get("pc_scores", None)
         x, c = self.get_batch_input(
             batch, random_uncond=random_uncond, is_imgbatch=is_imgbatch
         )
@@ -1053,7 +1125,7 @@ class LatentDiffusion(DDPM):
             cond = {key: cond}
 
         x_recon = self.model(x_noisy, t, **cond, **kwargs)
-        if self.loss_type == "dpo":
+        if self.loss_type in ["dpo", "group_dpo"]:
             self.ref_pred = self.shared_ref_pred(x_noisy, t, cond, kwargs)
         if isinstance(x_recon, tuple):
             return x_recon[0]
@@ -1085,7 +1157,7 @@ class LatentDiffusion(DDPM):
             model_output = model_output[:, :, self.frame_cond :, :, :]
             target = target[:, :, self.frame_cond :, :, :]
         # why notice: model output shape [1, 16, 2, 40, 64]
-        if self.loss_type == "dpo":
+        if self.loss_type in ["dpo", "group_dpo"]:
             loss_simple = self.get_loss(model_output, target, mean=False)
         else:
             loss_simple = self.get_loss(model_output, target, mean=False).mean(
