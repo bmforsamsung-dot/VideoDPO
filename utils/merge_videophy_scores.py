@@ -9,6 +9,7 @@ def main():
     parser.add_argument("--sa_csv", type=str, required=True)
     parser.add_argument("--pc_csv", type=str, required=True)
     parser.add_argument("--video_col", type=str, default="videopath")
+    parser.add_argument("--video_idx_col", type=str, default=None)
     parser.add_argument("--score_col", type=str, default="score")
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--normalize_divisor", type=float, default=5.0)
@@ -21,15 +22,22 @@ def main():
 
     sa_map = dict(zip(sa_df[args.video_col], sa_df[args.score_col]))
     pc_map = dict(zip(pc_df[args.video_col], pc_df[args.score_col]))
+    sa_idx_map = {}
+    pc_idx_map = {}
+    if args.video_idx_col is not None:
+        sa_idx_map = dict(zip(sa_df[args.video_idx_col], sa_df[args.score_col]))
+        pc_idx_map = dict(zip(pc_df[args.video_idx_col], pc_df[args.score_col]))
 
     missing = 0
     for g in groups:
         for loser in g.get("losers", []):
             key = loser.get("video_path", None)
-            if key is None:
-                continue
-            sa = sa_map.get(key, None)
-            pc = pc_map.get(key, None)
+            sa = sa_map.get(key, None) if key is not None else None
+            pc = pc_map.get(key, None) if key is not None else None
+            if (sa is None or pc is None) and args.video_idx_col is not None:
+                vidx = loser.get("video_idx", None)
+                sa = sa_idx_map.get(vidx, sa)
+                pc = pc_idx_map.get(vidx, pc)
             if sa is None or pc is None:
                 missing += 1
                 continue
