@@ -7,16 +7,10 @@ from collections import defaultdict
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--input",
-        type=str,
-        default=None,
-        help="optional flat prompt/sample json (pair format is no longer required)",
-    )
-    parser.add_argument(
         "--metadata_json",
         type=str,
-        default=None,
-        help="optional metadata.json path for resolving video_path and win/lose type",
+        required=True,
+        help="metadata.json path for resolving video_path and win/lose type",
     )
     parser.add_argument(
         "--winner_path_keyword",
@@ -47,88 +41,56 @@ def main():
     parser.add_argument("--losers_per_prompt", type=int, default=5)
     args = parser.parse_args()
 
-    data = []
-    if args.input is not None:
-        with open(args.input, "r") as f:
-            data = json.load(f)
     metadata = None
     if args.metadata_json is not None:
         with open(args.metadata_json, "r") as f:
             metadata = json.load(f)
-    if args.input is None and metadata is None:
-        raise ValueError("Provide at least one of --input or --metadata_json")
+    if metadata is None:
+        raise ValueError("Provide --metadata_json")
 
     groups = defaultdict(lambda: {"frame_caption": "", "winner": None, "losers": []})
-    if args.input is not None:
-        # Mode B: flat sample list format
-        # [{"prompt_id":"...", "video_idx":..., "is_real":bool, ...}, ...]
-        for item in data:
-            pid = item["prompt_id"]
-            groups[pid]["frame_caption"] = item.get("frame_caption", "")
-            if item.get("is_real", False):
-                winner_obj = {
-                    "video_idx": int(item["video_idx"]),
-                    "is_real": True,
-                    "sa_score": 1.0,
-                    "pc_score": 1.0,
-                }
-                if metadata is not None:
-                    widx = int(item["video_idx"])
-                    winner_obj["video_path"] = metadata[widx]["basic"]["clip_path"]
-                groups[pid]["winner"] = winner_obj
-            else:
-                loser_obj = {
-                    "video_idx": int(item["video_idx"]),
-                    "sa_score": float(item.get("sa_score", 0.0)),
-                    "pc_score": float(item.get("pc_score", 0.0)),
-                }
-                if metadata is not None:
-                    lidx = int(item["video_idx"])
-                    loser_obj["video_path"] = metadata[lidx]["basic"]["clip_path"]
-                groups[pid]["losers"].append(loser_obj)
-    else:
-        # Mode C: build groups directly from metadata.json.
-        # Winner/loser are inferred from clip_path keywords.
-        by_caption = defaultdict(list)
-        for idx, item in enumerate(metadata):
-            if args.group_by == "prompt_id":
-                key = item.get("misc", {}).get("prompt_id", "")
-            else:
-                key = item.get("misc", {}).get("frame_caption", [""])
-                key = key[0] if isinstance(key, list) else key
-            by_caption[key].append((idx, item))
+    # Build groups directly from metadata.json.
+    # Winner/loser are inferred from clip_path keywords.
+    by_caption = defaultdict(list)
+    for idx, item in enumerate(metadata):
+        if args.group_by == "prompt_id":
+            key = item.get("misc", {}).get("prompt_id", "")
+        else:
+            key = item.get("misc", {}).get("frame_caption", [""])
+            key = key[0] if isinstance(key, list) else key
+        by_caption[key].append((idx, item))
 
-        for cap, samples in by_caption.items():
-            winners = []
-            losers = []
-            for idx, item in samples:
-                p = str(item.get("basic", {}).get("clip_path", "")).lower()
-                entry = {
-                    "video_idx": int(idx),
-                    "sa_score": 0.0,
-                    "pc_score": 0.0,
-                    "video_path": item.get("basic", {}).get("clip_path", ""),
-                }
-                if args.winner_path_keyword.lower() in p:
-                    winners.append(entry)
-                elif args.loser_path_keyword.lower() in p:
-                    losers.append(entry)
-                else:
-                    # ignore unknown tag path in metadata-only mode
-                    continue
-            if len(winners) == 0 or len(losers) == 0:
-                continue
-            winner_obj = {
-                "video_idx": winners[0]["video_idx"],
-                "is_real": True,
-                "sa_score": 1.0,
-                "pc_score": 1.0,
-                "video_path": winners[0]["video_path"],
+    for cap, samples in by_caption.items():
+        winners = []
+        losers = []
+        for idx, item in samples:
+            p = str(item.get("basic", {}).get("clip_path", "")).lower()
+            entry = {
+                "video_idx": int(idx),
+                "sa_score": 0.0,
+                "pc_score": 0.0,
+                "video_path": item.get("basic", {}).get("clip_path", ""),
             }
-            pid = f"cap::{cap.strip()}::winner::{winner_obj['video_idx']}"
-            groups[pid]["frame_caption"] = cap
-            groups[pid]["winner"] = winner_obj
-            groups[pid]["losers"] = losers[: args.losers_per_prompt]
+            if args.winner_path_keyword.lower() in p:
+                winners.append(entry)
+            elif args.loser_path_keyword.lower() in p:
+                losers.append(entry)
+            else:
+                # ignore unknown tag path in metadata-only mode
+                continue
+        if len(winners) == 0 or len(losers) == 0:
+            continue
+        winner_obj = {
+            "video_idx": winners[0]["video_idx"],
+            "is_real": True,
+            "sa_score": 1.0,
+            "pc_score": 1.0,
+            "video_path": winners[0]["video_path"],
+        }
+        pid = f"cap::{cap.strip()}::winner::{winner_obj['video_idx']}"
+        groups[pid]["frame_caption"] = cap
+        groups[pid]["winner"] = winner_obj
+        groups[pid]["losers"] = losers[: args.losers_per_prompt]
 
     out = []
     for pid, g in groups.items():
