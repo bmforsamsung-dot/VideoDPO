@@ -7,7 +7,7 @@ model:
   pretrained_checkpoint: checkpoints/vc2/model.ckpt
   target: lvdm.models.ddpm3d.LatentDiffusion
   params:
-    loss_type: dpo
+    loss_type: group_dpo
     log_every_t: 100
     linear_start: 0.00085
     linear_end: 0.012
@@ -30,6 +30,13 @@ model:
     use_scale: true
     scale_b: 0.7 # adapt to videocrafter-v2
     beta_dpo: 5000.0 # dpo config 
+    group_size: 6   # 1 real winner + 5 losers
+    lambda_physics: 1.0
+    kappa_alpha: 8.0
+    kappa_gamma: 8.0
+    b_alpha: 0.5
+    b_gamma: 0.5
+    alpha_min: 0.05
 
     
     unet_config:
@@ -96,9 +103,9 @@ data:
     num_workers: 16
     wrap: false
     train:
-      target: data.video_data.TextVideoDPO
+      target: data.video_data.TextVideoGroupDPO
       params:
-        dupbeta: 0 # dpo config ; if dupbeta ==0  , score will not be required
+        # group.json: one prompt -> one real winner + multiple losers
         data_root: configs/dpo/vidpro/train_data.yaml
         resolution: [320, 512]
         video_length: 16
